@@ -1,111 +1,88 @@
 #! -*- coding: utf-8 -*-
-# RWKV
-# tensorflow 1.15 + bert4keras 0.11.4 测试通过
 
-from bert4keras.layers import *
+import torch
+import torch.nn as nn
+import numpy as np
+import math
 
-
-class RWKV(Layer):
-    """RWKV
-    链接1：https://github.com/BlinkDL/RWKV-LM
-    链接2：https://kexue.fm/archives/9554
+class RWKV(nn.Module):
+    """RWKV模块 - PyTorch实现
+    链接1 https://github.com/BlinkDL/RWKV-LM
+    链接2 https://kexue.fm/archives/9554
+    
+    Args:
+        hidden_size: 隐藏层大小
+        units: 输出单元数
+        use_bias: 是否使用偏置 默认为True
+        unroll: 是否展开计算，可加速训练但会增加显存消耗
     """
     def __init__(
         self,
+        hidden_size,
         units,
         use_bias=True,
-        unroll=True,
-        kernel_initializer='glorot_uniform',
-        **kwargs
+        unroll=True
     ):
-        super(RWKV, self).__init__(**kwargs)
+        super().__init__()
+        self.hidden_size = hidden_size
         self.units = units
         self.use_bias = use_bias
         self.unroll = unroll
-        self.kernel_initializer = initializers.get(kernel_initializer)
-
-    @integerize_shape
-    def build(self, input_shape):
-        super(RWKV, self).build(input_shape)
-        hidden_size = input_shape[-1]
-        self.rkv_dense = Dense(
-            units=self.units * 3,
-            use_bias=self.use_bias,
-            kernel_initializer=self.kernel_initializer
+        
+        # RKV映射层
+        self.rkv_dense = nn.Linear(hidden_size, units * 3, bias=use_bias)
+        # 输出映射层
+        self.o_dense = nn.Linear(units, hidden_size, bias=use_bias)
+        
+        # 初始化参数
+        r_min, r_max = 0.9, 0.999
+        u = torch.rand(units)
+        self.nu_log = nn.Parameter(
+            torch.log(-0.5 * torch.log(u * (r_max**2 - r_min**2) + r_min**2))
         )
-        self.o_dense = Dense(
-            units=hidden_size,
-            use_bias=self.use_bias,
-            kernel_initializer=self.kernel_initializer
-        )
+        self.gamma_log = nn.Parameter(torch.zeros(units))
 
-        def initializer(shape, dtype=None):
-            r_min, r_max = 0.9, 0.999
-            u = np.random.random(size=shape)
-            return np.log(-0.5 * np.log(u * (r_max**2 - r_min**2) + r_min**2))
-
-        self.nu_log = self.add_weight(
-            name='nu_log', shape=(self.units,), initializer=initializer
-        )
-        self.gamma_log = self.add_weight(
-            name='gamma_log', shape=(self.units,), initializer='zeros'
-        )
-
-    @recompute_grad
-    def call(self, inputs, mask=None):
+    def forward(self, inputs):
         rkv = self.rkv_dense(inputs)
-        r, k, v = tf.split(rkv, 3, axis=-1)
-        r, k = K.sigmoid(r), K.exp(k)
+        r, k, v = torch.chunk(rkv, 3, dim=-1)
+        r = torch.sigmoid(r)
+        k = torch.exp(k)
+        
         kv = k * v
-        u = K.concatenate([kv, k], axis=-1)
-        nu = K.exp(K.concatenate([self.nu_log, self.nu_log], axis=0))
-        gamma = K.exp(self.nu_log + self.gamma_log) - 1
+        u = torch.cat([kv, k], dim=-1)
+        nu = torch.exp(torch.cat([self.nu_log, self.nu_log]))
+        gamma = torch.exp(self.nu_log + self.gamma_log) - 1
 
-        if self.unroll:
-            L_in = K.int_shape(u)[1]
-            assert L_in is not None, 'input_length can not be None while unroll=True'
-            log2_L = int(np.ceil(np.log2(L_in)))
-        else:
-            L_in = K.shape(u)[1]
-            log2_L = K.log(K.cast(L_in, K.floatx())) / K.log(2.)
-            log2_L = K.cast(tf.ceil(log2_L), 'int32')
+        B, L, _ = inputs.shape
+        
+        # 计算需要的填充长度
+        log2_L = int(np.ceil(np.log2(L)))
+        pad_len = 2**log2_L - L
+        u_padded = torch.nn.functional.pad(u, (0, 0, 0, pad_len))
 
-        u = tf.pad(u, [[0, 0], [0, 2**log2_L - K.shape(u)[1]], [0, 0]])
-        B, L, D = K.shape(u)[0], K.shape(u)[1], K.int_shape(u)[-1]
-
-        def rwkv(i, x):
+        def rwkv_step(x, i):
             l = 2**i
-            x = K.reshape(x, [B * L // l, l, D])
-            x1, x2 = x[:, :l // 2], x[:, l // 2:]
-
-            pos = K.arange(1, l // 2 + 1, dtype=K.floatx())
-            nus = tf.einsum('n,d->nd', pos, nu)
-            lambs = K.exp(-nus)
-
+            x = x.view(B * (2**log2_L) // l, l, -1)
+            x1, x2 = x[:, :l//2], x[:, l//2:]
+            
+            pos = torch.arange(1, l//2 + 1, device=x.device, dtype=torch.float32)
+            nus = torch.outer(pos, nu)
+            lambs = torch.exp(-nus)
+            
             x2 = x2 + lambs * x1[:, -1:]
-            x = K.concatenate([x1, x2], axis=1)
-            if (not self.unroll) and K.int_shape(u)[1] is not None:
-                x = K.reshape(x, [B, L, D])
+            x = torch.cat([x1, x2], dim=1)
+            return x.view(B, 2**log2_L, -1)
 
-            return i + 1, x
-
+        x = u_padded
         if self.unroll:
             for i in range(log2_L):
-                _, u = rwkv(i + 1, u)
+                x = rwkv_step(x, i + 1)
         else:
-            _, u = tf.while_loop(lambda i, x: i <= log2_L, rwkv, [1, u])
+            for i in range(1, log2_L + 1):
+                x = rwkv_step(x, i)
 
-        u1, u2 = tf.split(u[:, :L_in], 2, axis=-1)
-        u = tf.math.divide_no_nan(u1 + gamma * kv, u2 + gamma * k) * r
-        return self.o_dense(u)
-
-    def get_config(self):
-        config = {
-            'units': self.units,
-            'use_bias': self.use_bias,
-            'unroll': self.unroll,
-            'kernel_initializer':
-                initializers.serialize(self.kernel_initializer),
-        }
-        base_config = super(RWKV, self).get_config()
-        return dict(list(base_config.items()) + list(config.items()))
+        x = x[:, :L]
+        u1, u2 = torch.chunk(x, 2, dim=-1)
+        x = (u1 + gamma * kv) / (u2 + gamma * k + 1e-6) * r
+        
+        return self.o_dense(x)
